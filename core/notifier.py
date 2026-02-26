@@ -225,3 +225,18 @@ async def notify_credits_warning(
         f"잔여: {remaining:,} (경고 임계값: {threshold:,})\n"
         f"조만간 크레딧이 소진될 수 있습니다.",
     )
+
+
+async def notify_daily_limit(
+    session: aiohttp.ClientSession,
+    count: int,
+    limit: int,
+    wait_hours: float,
+) -> None:
+    """일일 Odds API 호출 한도 도달 알림."""
+    await _send(
+        session,
+        f"📵 <b>일일 호출 한도 도달</b>\n"
+        f"오늘 호출: {count}/{limit}회\n"
+        f"{wait_hours:.1f}시간 후(자정 UTC) 자동 재개됩니다.",
+    )

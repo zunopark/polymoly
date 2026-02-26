@@ -15,9 +15,9 @@ ODDS_BOOKMAKERS = "pinnacle"
 ODDS_SPORT      = "basketball_nba"   # MLB 추가 예정
 
 # ── 실행 조건 (4가지 모두 충족해야 매수) ────────────────────
-MAX_PINNACLE_ODDS    = 1.7    # 배당 상한선
+MAX_PINNACLE_ODDS    = 1.55   # 배당 상한선
 MAX_POLYMARKET_PRICE = 0.50   # 폴리마켓 역배 기준 (50센트 미만)
-GAP_THRESHOLD        = 0.10   # 최소 갭 크기
+GAP_THRESHOLD        = 0.15   # 최소 갭 크기
 MIN_LIQUIDITY_SHARES = 30     # 최소 유동성 (shares)
 
 # ── 경기 진입 시간 ───────────────────────────────────────────
@@ -27,7 +27,7 @@ BET_ENTRY_DEADLINE_HRS = 1    # 경기 시작 N시간 전 마감 (이 이하면 
 # ── 베팅 금액 ────────────────────────────────────────────────
 MAX_BET_USDC = 30
 MIN_BET_USDC = 5
-MAX_POSITIONS = 3
+MAX_POSITIONS = 5
 
 # 갭 크기별 베팅 금액 [(gap_min, gap_max, usdc)]
 BET_SIZE_TIERS = [
@@ -43,8 +43,9 @@ MAX_CONSECUTIVE_LOSSES = 3   # 연속 N패 시 자동 중단
 POLL_INTERVAL = 3600   # 기본 1시간
 
 # ── Odds API 크레딧 제어 ─────────────────────────────────────
-CREDITS_WARNING_THRESHOLD = 2000   # 잔여 이하면 텔레그램 경고 발송
-CREDITS_MIN_RESERVE       = 500    # 잔여 이하면 Odds API 호출 중단
+CREDITS_WARNING_THRESHOLD = 50     # 잔여 이하면 텔레그램 경고 발송
+CREDITS_MIN_RESERVE       = 10     # 잔여 이하면 Odds API 호출 중단
+DAILY_MAX_API_CALLS       = 100    # 하루 최대 Odds API 호출 횟수
 
 # ── 파일 경로 ────────────────────────────────────────────────
 DB_PATH           = "data/positions.db"

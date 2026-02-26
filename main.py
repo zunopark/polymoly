@@ -15,7 +15,7 @@ main.py - Polymarket 배당 역전 봇 (polymoly) 진입점
 import asyncio
 import logging
 import logging.handlers
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import aiohttp
@@ -35,9 +35,9 @@ from core.notifier import (
     notify_auto_stopped, notify_low_credits,
     notify_poll_start, notify_no_games, notify_no_markets,
     notify_no_matches, notify_no_opportunities,
-    notify_error, notify_credits_warning,
+    notify_error, notify_credits_warning, notify_daily_limit,
 )
-from core.odds_fetcher import fetch_nba_games, InsufficientCreditsError, load_credits
+from core.odds_fetcher import fetch_nba_games, InsufficientCreditsError, DailyLimitReachedError, load_credits
 from core.scanner import scan
 
 load_dotenv()
@@ -158,6 +158,16 @@ async def polling_loop(
                 elif result.status not in ("skipped",):
                     await notify_failed(session, result)
 
+        except DailyLimitReachedError as e:
+            log.warning(str(e))
+            now      = datetime.now(timezone.utc)
+            midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            wait_sec = (midnight - now).total_seconds()
+            wait_hrs = wait_sec / 3600
+            log.info(f"[main] 일일 한도 — {wait_hrs:.1f}시간 후(자정 UTC) 재개")
+            await notify_daily_limit(session, e.count, e.limit, wait_hrs)
+            await asyncio.sleep(wait_sec)
+            continue
         except InsufficientCreditsError as e:
             log.error(str(e))
             await notify_low_credits(session, e.remaining)

@@ -171,14 +171,11 @@ TELEGRAM_CHAT_ID=
   - [x] allowance 파싱 버그 수정 (`"allowance"` 단수 → `"allowances"` 복수 딕셔너리)
   - [x] CLOB 오더북 정렬 버그 수정 (`asks[0]` 최고가 → `asks[-1]` 최저가) — test_executor.py + scanner.py
   - [x] 유동성 집계 버그 수정 (단일 호가 size → asks[-3:] 합산) — test_executor.py + scanner.py
-  - [ ] `python test_executor.py --confirm --amount 5` 로 실제 매수 테스트
+  - [x] `python test_executor.py --confirm --amount 5` 로 실제 매수 테스트
+        → 2026-02-26: Hornets vs. Pacers NO @ $0.15, $5 FOK 즉시 체결 (bet_id=1)
 - [ ] 소액으로 먼저 실전 운영 시작 (최대 배팅 금액 $10~30)
 - [ ] db.py 배팅 기록 확인 기능 추가
 - [ ] NHL 추가 (NBA 안정화 후)
 - [ ] EPL 추가 (NBA 안정화 후)
 
 ---
-
-### 다음 재개 시 순서
-1. `python test_executor.py --confirm --amount 5` → 실제 $5 FOK 매수
-2. DB 기록 확인 (`data/positions.db`)

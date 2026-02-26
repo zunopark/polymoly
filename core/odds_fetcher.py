@@ -23,6 +23,7 @@ from dotenv import load_dotenv
 from config import (
     ODDS_API_BASE, ODDS_BOOKMAKERS, ODDS_SPORT, MAX_PINNACLE_ODDS,
     CREDITS_MIN_RESERVE, CREDITS_WARNING_THRESHOLD, CREDITS_STATE_PATH,
+    DAILY_MAX_API_CALLS,
 )
 
 load_dotenv()
@@ -40,25 +41,45 @@ class InsufficientCreditsError(Exception):
         )
 
 
+class DailyLimitReachedError(Exception):
+    """일일 Odds API 호출 한도 초과 — 자정까지 대기."""
+    def __init__(self, count: int, limit: int):
+        self.count = count
+        self.limit = limit
+        super().__init__(
+            f"[odds_fetcher] 일일 호출 한도 도달: {count}/{limit} — 자정 이후 재개"
+        )
+
+
 # ── 크레딧 상태 파일 I/O ─────────────────────────────────────
+
+def _load_state() -> dict:
+    """credits.json 전체 상태 로드. 파일 없으면 빈 dict."""
+    try:
+        return json.loads(Path(CREDITS_STATE_PATH).read_text())
+    except Exception:
+        return {}
+
 
 def _load_credits() -> int | None:
     """마지막으로 저장된 잔여 크레딧 로드. 파일 없으면 None."""
+    state = _load_state()
     try:
-        data = json.loads(Path(CREDITS_STATE_PATH).read_text())
-        return int(data["remaining"])
-    except Exception:
+        return int(state["remaining"])
+    except (KeyError, TypeError, ValueError):
         return None
 
 
-def _save_credits(remaining: int, used: int) -> None:
-    """잔여/사용 크레딧을 JSON 파일에 저장."""
+def _save_credits(remaining: int, used: int, daily_date: str, daily_calls: int) -> None:
+    """잔여/사용 크레딧 + 일일 호출 횟수를 JSON 파일에 저장."""
     path = Path(CREDITS_STATE_PATH)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({
-        "remaining":  remaining,
-        "used":       used,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "remaining":   remaining,
+        "used":        used,
+        "daily_date":  daily_date,
+        "daily_calls": daily_calls,
+        "updated_at":  datetime.now(timezone.utc).isoformat(),
     }, indent=2))
 
 
@@ -121,9 +142,16 @@ async def fetch_nba_games(session: aiohttp.ClientSession) -> list[PinnacleGame]:
         raise ValueError("[odds_fetcher] ODDS_API_KEY 미설정")
 
     # 사전 크레딧 체크 (저장된 이전 값 기준)
-    cached = _load_credits()
-    if cached is not None and cached < CREDITS_MIN_RESERVE:
-        raise InsufficientCreditsError(cached)
+    state  = _load_state()
+    cached = state.get("remaining")
+    if cached is not None and int(cached) < CREDITS_MIN_RESERVE:
+        raise InsufficientCreditsError(int(cached))
+
+    # 일일 호출 횟수 체크
+    today      = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    day_calls  = state.get("daily_calls", 0) if state.get("daily_date") == today else 0
+    if day_calls >= DAILY_MAX_API_CALLS:
+        raise DailyLimitReachedError(day_calls, DAILY_MAX_API_CALLS)
 
     url = f"{ODDS_API_BASE}/sports/{ODDS_SPORT}/odds"
     params = {
@@ -140,12 +168,15 @@ async def fetch_nba_games(session: aiohttp.ClientSession) -> list[PinnacleGame]:
         resp.raise_for_status()
         raw_games: list[dict] = await resp.json()
 
-    # 크레딧 파싱 + 저장
+    # 크레딧 파싱 + 저장 (일일 호출 횟수 +1)
     try:
         remaining = int(remaining_str)
         used      = int(used_str)
-        _save_credits(remaining, used)
-        log.info(f"[odds_fetcher] 크레딧: 사용={used:,}, 남은={remaining:,}")
+        _save_credits(remaining, used, today, day_calls + 1)
+        log.info(
+            f"[odds_fetcher] 크레딧: 사용={used:,}, 남은={remaining:,} "
+            f"| 오늘 호출: {day_calls + 1}/{DAILY_MAX_API_CALLS}"
+        )
 
         if remaining < CREDITS_MIN_RESERVE:
             raise InsufficientCreditsError(remaining)
