@@ -1,229 +1,208 @@
 """
-core/odds_fetcher.py - Odds API 호출, Pinnacle 배당 수집 (다종목)
+core/odds_fetcher.py - Pinnacle NBA 배당 수집
 
-지원 종목: config.ACTIVE_SPORTS 기준 (NBA, NHL, EPL)
-E스포츠: Odds API sports 목록에 esports 키 없음 → 지원 불가
+Odds API에서 Pinnacle 배당을 가져와 정배(1.5 이하) 경기만 반환.
+크레딧 소비: 경기 수 × 1 (Pinnacle 단일 북메이커)
 
-마켓별 처리:
-  h2h (NBA, NHL): outcomes 2개, point 없음
-  spreads (EPL):  outcomes 2개 + point(핸디캡 라인)
-                  0.5 단위 라인만 허용 (이진 결과 보장)
-                  0.0 (Draw No Bet), 0.25/0.75 쿼터핸디 제외
-
-크레딧 소비:
-  docs: bookmakers=pinnacle 직접 지정 시 1크레딧/종목 고정
-  3종목 동시 조회: 3크레딧/폴링 사이클
+크레딧 제어:
+  - 매 호출 후 잔여 크레딧을 data/credits.json에 저장
+  - 잔여 < CREDITS_MIN_RESERVE → InsufficientCreditsError 발생 (호출 차단)
+  - 잔여 < CREDITS_WARNING_THRESHOLD → 경고 로그 (main.py에서 Telegram 알림)
 """
 
+import json
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 
 import aiohttp
 from dotenv import load_dotenv
 
-from config import ODDS_API_BASE, ODDS_BOOKMAKERS, SPORTS_CONFIG, ACTIVE_SPORTS
+from config import (
+    ODDS_API_BASE, ODDS_BOOKMAKERS, ODDS_SPORT, MAX_PINNACLE_ODDS,
+    CREDITS_MIN_RESERVE, CREDITS_WARNING_THRESHOLD, CREDITS_STATE_PATH,
+)
 
 load_dotenv()
 log = logging.getLogger(__name__)
 
 
-# ── 데이터 구조 ─────────────────────────────────────────────
+# ── 크레딧 예외 ──────────────────────────────────────────────
 
-@dataclass
-class PinnacleTeamOdds:
-    """단일 팀의 Pinnacle 배당 정보."""
-    name: str            # 팀 전체 이름 (예: "Los Angeles Lakers")
-    odds: float          # Pinnacle 배당 (예: 1.4)
-    implied_prob: float  # 임플라이드 확률 (예: 0.714) = 1 / odds
-    handicap_point: float | None = None  # spreads 전용: 핸디캡 라인 (예: -0.5)
+class InsufficientCreditsError(Exception):
+    """잔여 크레딧 부족 — Odds API 호출 차단."""
+    def __init__(self, remaining: int):
+        self.remaining = remaining
+        super().__init__(
+            f"[odds_fetcher] 잔여 크레딧 {remaining} < 최솟값 {CREDITS_MIN_RESERVE} — 호출 차단"
+        )
+
+
+# ── 크레딧 상태 파일 I/O ─────────────────────────────────────
+
+def _load_credits() -> int | None:
+    """마지막으로 저장된 잔여 크레딧 로드. 파일 없으면 None."""
+    try:
+        data = json.loads(Path(CREDITS_STATE_PATH).read_text())
+        return int(data["remaining"])
+    except Exception:
+        return None
+
+
+def _save_credits(remaining: int, used: int) -> None:
+    """잔여/사용 크레딧을 JSON 파일에 저장."""
+    path = Path(CREDITS_STATE_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "remaining":  remaining,
+        "used":       used,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }, indent=2))
+
+
+def load_credits() -> int | None:
+    """마지막으로 저장된 잔여 크레딧 반환 (외부 크레딧 상태 확인용)."""
+    return _load_credits()
 
 
 @dataclass
 class PinnacleGame:
-    """단일 경기 + Pinnacle 배당."""
-    sport_id: str            # config SPORTS_CONFIG 키 (예: "nba", "nhl", "epl")
-    game_id: str             # Odds API 경기 고유 ID
-    commence_time: datetime  # 경기 시작 시간 (UTC)
-    home_team: str
-    away_team: str
-    home_odds: PinnacleTeamOdds
-    away_odds: PinnacleTeamOdds
-    max_odds: float = field(default=1.5)  # 종목별 정배 기준 (SPORTS_CONFIG에서 주입)
+    """단일 NBA 경기 + Pinnacle h2h 배당."""
+    game_id:       str
+    home_team:     str       # Odds API 전체 팀명 (예: "Miami Heat")
+    away_team:     str
+    commence_time: datetime  # UTC
+    home_odds:     float     # Pinnacle 소수 배당
+    away_odds:     float
 
     @property
-    def favorite(self) -> PinnacleTeamOdds | None:
-        """max_odds 이하인 정배 팀 반환. 없으면 None."""
-        if self.home_odds.odds <= self.max_odds:
-            return self.home_odds
-        if self.away_odds.odds <= self.max_odds:
-            return self.away_odds
-        return None
+    def favorite_is_home(self) -> bool:
+        """홈팀이 정배(낮은 배당)이면 True."""
+        return self.home_odds <= self.away_odds
 
     @property
-    def underdog(self) -> PinnacleTeamOdds | None:
-        fav = self.favorite
-        if fav is None:
-            return None
-        return self.away_odds if fav is self.home_odds else self.home_odds
+    def favorite_team(self) -> str:
+        return self.home_team if self.favorite_is_home else self.away_team
+
+    @property
+    def favorite_odds(self) -> float:
+        return min(self.home_odds, self.away_odds)
+
+    @property
+    def favorite_prob(self) -> float:
+        """임플라이드 확률 (소수). 예: 1.4배당 → 0.714"""
+        return round(1 / self.favorite_odds, 4)
 
     def hours_until_start(self) -> float:
-        now = datetime.now(timezone.utc)
-        return (self.commence_time - now).total_seconds() / 3600
+        return (self.commence_time - datetime.now(timezone.utc)).total_seconds() / 3600
 
     def __str__(self) -> str:
-        fav = self.favorite
-        fav_str = (
-            f"{fav.name} ({fav.odds:.2f}배"
-            + (f", 핸디 {fav.handicap_point:+.1f}" if fav.handicap_point is not None else "")
-            + f", {fav.implied_prob:.1%})"
-            if fav else "없음"
-        )
-        hrs = self.hours_until_start()
-        sport_cfg = SPORTS_CONFIG.get(self.sport_id, {})
         return (
-            f"[{sport_cfg.get('label', self.sport_id)}] "
-            f"{self.home_team} vs {self.away_team} "
-            f"| 시작: {hrs:.1f}h 후 | 정배: {fav_str}"
+            f"[NBA] {self.home_team} vs {self.away_team} | "
+            f"정배: {self.favorite_team} "
+            f"({self.favorite_odds:.2f}배 / {self.favorite_prob:.1%}) | "
+            f"시작: {self.hours_until_start():.1f}h 후"
         )
 
 
-# ── Odds API 호출 ───────────────────────────────────────────
-
-async def fetch_all_sports(
-    session: aiohttp.ClientSession,
-) -> list[PinnacleGame]:
-    """ACTIVE_SPORTS의 모든 종목 배당을 수집. 총 N크레딧 (종목 수만큼).
+async def fetch_nba_games(session: aiohttp.ClientSession) -> list[PinnacleGame]:
+    """Pinnacle NBA 경기 배당 수집.
 
     Returns:
-        전체 종목의 PinnacleGame 리스트 (정배 있는 경기만).
+        정배(MAX_PINNACLE_ODDS 이하) 팀이 있는 경기 목록.
+
+    Raises:
+        InsufficientCreditsError: 잔여 크레딧이 CREDITS_MIN_RESERVE 미만일 때.
     """
     api_key = os.getenv("ODDS_API_KEY")
     if not api_key:
         raise ValueError("[odds_fetcher] ODDS_API_KEY 미설정")
 
-    all_games: list[PinnacleGame] = []
+    # 사전 크레딧 체크 (저장된 이전 값 기준)
+    cached = _load_credits()
+    if cached is not None and cached < CREDITS_MIN_RESERVE:
+        raise InsufficientCreditsError(cached)
 
-    for sport_id in ACTIVE_SPORTS:
-        cfg = SPORTS_CONFIG.get(sport_id)
-        if cfg is None:
-            log.warning(f"[odds_fetcher] SPORTS_CONFIG에 없는 종목: {sport_id}")
-            continue
-        games = await _fetch_sport(session, api_key, sport_id, cfg)
-        all_games.extend(games)
-
-    log.info(f"[odds_fetcher] 전체 {len(all_games)}경기 수집 (정배 기준 충족)")
-    return all_games
-
-
-async def _fetch_sport(
-    session: aiohttp.ClientSession,
-    api_key: str,
-    sport_id: str,
-    cfg: dict,
-) -> list[PinnacleGame]:
-    """단일 종목 배당 조회 (1크레딧)."""
-    sport_key = cfg["sport_key"]
-    markets   = cfg["markets"]
-    label     = cfg["label"]
-    max_odds  = cfg["max_pinnacle_odds"]
-
-    url = f"{ODDS_API_BASE}/sports/{sport_key}/odds"
+    url = f"{ODDS_API_BASE}/sports/{ODDS_SPORT}/odds"
     params = {
         "apiKey":     api_key,
         "bookmakers": ODDS_BOOKMAKERS,
-        "markets":    markets,
+        "markets":    "h2h",
         "oddsFormat": "decimal",
         "dateFormat": "iso",
     }
 
-    log.info(f"[odds_fetcher] {label} 조회 중... (markets={markets})")
     async with session.get(url, params=params) as resp:
-        remaining = resp.headers.get("x-requests-remaining", "?")
-        used      = resp.headers.get("x-requests-used", "?")
-        log.info(f"[odds_fetcher] {label} 크레딧 사용={used}, 남은={remaining}")
+        remaining_str = resp.headers.get("x-requests-remaining", "")
+        used_str      = resp.headers.get("x-requests-used", "")
         resp.raise_for_status()
         raw_games: list[dict] = await resp.json()
 
-    is_handicap = cfg.get("is_handicap", False)
-    games = _parse_games(raw_games, sport_id, max_odds, is_handicap)
-    log.info(
-        f"[odds_fetcher] {label}: 전체 {len(raw_games)}경기 중 "
-        f"정배 충족 {len(games)}경기"
-    )
+    # 크레딧 파싱 + 저장
+    try:
+        remaining = int(remaining_str)
+        used      = int(used_str)
+        _save_credits(remaining, used)
+        log.info(f"[odds_fetcher] 크레딧: 사용={used:,}, 남은={remaining:,}")
+
+        if remaining < CREDITS_MIN_RESERVE:
+            raise InsufficientCreditsError(remaining)
+        if remaining < CREDITS_WARNING_THRESHOLD:
+            log.warning(
+                f"[odds_fetcher] ⚠️ 크레딧 경고: 잔여 {remaining:,} "
+                f"(경고 임계값 {CREDITS_WARNING_THRESHOLD:,})"
+            )
+    except InsufficientCreditsError:
+        raise
+    except (ValueError, TypeError):
+        log.debug(f"[odds_fetcher] 크레딧 헤더 파싱 실패: remaining='{remaining_str}' used='{used_str}'")
+
+    games = _parse(raw_games)
+    log.info(f"[odds_fetcher] NBA {len(raw_games)}경기 → 정배 {len(games)}경기")
     return games
 
 
-# ── 파싱 ────────────────────────────────────────────────────
-
-def _parse_games(
-    raw_games: list[dict],
-    sport_id: str,
-    max_odds: float,
-    is_handicap: bool,
-) -> list[PinnacleGame]:
-    """Odds API 응답 파싱 → PinnacleGame 리스트 (정배 존재 경기만)."""
-    result: list[PinnacleGame] = []
+def _parse(raw_games: list[dict]) -> list[PinnacleGame]:
+    """Odds API 응답 파싱 → 정배 있는 PinnacleGame 리스트."""
+    result = []
 
     for raw in raw_games:
-        game_id      = raw.get("id", "")
-        home_team    = raw.get("home_team", "")
-        away_team    = raw.get("away_team", "")
-        commence_raw = raw.get("commence_time", "")
-
         try:
             commence_time = datetime.fromisoformat(
-                commence_raw.replace("Z", "+00:00")
+                raw["commence_time"].replace("Z", "+00:00")
             )
-        except (ValueError, AttributeError):
-            log.warning(f"[odds_fetcher] 시간 파싱 실패: {commence_raw}")
+        except (KeyError, ValueError):
+            log.warning(f"[odds_fetcher] 시간 파싱 실패: {raw.get('commence_time')}")
             continue
 
-        pinnacle_data = _find_pinnacle(raw.get("bookmakers", []))
-        if pinnacle_data is None:
-            log.debug(f"[odds_fetcher] Pinnacle 없음: {home_team} vs {away_team}")
+        pinnacle = _find_pinnacle(raw.get("bookmakers", []))
+        if pinnacle is None:
             continue
 
-        if is_handicap:
-            home_odds_val, away_odds_val, home_point, away_point = \
-                _extract_spreads_odds(pinnacle_data, home_team, away_team)
-        else:
-            home_odds_val, away_odds_val = \
-                _extract_h2h_odds(pinnacle_data, home_team, away_team)
-            home_point = away_point = None
+        home_team = raw.get("home_team", "")
+        away_team = raw.get("away_team", "")
+        home_odds, away_odds = _extract_h2h(pinnacle, home_team, away_team)
 
-        if home_odds_val is None or away_odds_val is None:
-            log.debug(f"[odds_fetcher] 배당 파싱 실패: {home_team} vs {away_team}")
+        if home_odds is None or away_odds is None:
+            log.debug(f"[odds_fetcher] 배당 없음: {home_team} vs {away_team}")
             continue
 
-        home_odds = PinnacleTeamOdds(
-            name=home_team,
-            odds=home_odds_val,
-            implied_prob=round(1 / home_odds_val, 4),
-            handicap_point=home_point,
-        )
-        away_odds = PinnacleTeamOdds(
-            name=away_team,
-            odds=away_odds_val,
-            implied_prob=round(1 / away_odds_val, 4),
-            handicap_point=away_point,
-        )
+        # 두 팀 중 하나라도 MAX_PINNACLE_ODDS 이하여야 함
+        if min(home_odds, away_odds) > MAX_PINNACLE_ODDS:
+            continue
 
         game = PinnacleGame(
-            sport_id=sport_id,
-            game_id=game_id,
-            commence_time=commence_time,
+            game_id=raw.get("id", ""),
             home_team=home_team,
             away_team=away_team,
+            commence_time=commence_time,
             home_odds=home_odds,
             away_odds=away_odds,
-            max_odds=max_odds,
         )
-
-        if game.favorite is not None:
-            result.append(game)
-            log.debug(str(game))
+        result.append(game)
+        log.debug(str(game))
 
     return result
 
@@ -235,13 +214,13 @@ def _find_pinnacle(bookmakers: list[dict]) -> dict | None:
     return None
 
 
-def _extract_h2h_odds(
-    pinnacle_data: dict,
+def _extract_h2h(
+    pinnacle: dict,
     home_team: str,
     away_team: str,
 ) -> tuple[float | None, float | None]:
-    """h2h 마켓에서 홈/원정 배당 추출. (NBA, NHL)"""
-    for market in pinnacle_data.get("markets", []):
+    """h2h 마켓에서 홈/원정 배당 추출."""
+    for market in pinnacle.get("markets", []):
         if market.get("key") != "h2h":
             continue
         home_price = away_price = None
@@ -256,67 +235,3 @@ def _extract_h2h_odds(
                 away_price = float(price)
         return home_price, away_price
     return None, None
-
-
-def _extract_spreads_odds(
-    pinnacle_data: dict,
-    home_team: str,
-    away_team: str,
-) -> tuple[float | None, float | None, float | None, float | None]:
-    """spreads 마켓에서 홈/원정 배당 + 핸디캡 라인 추출. (EPL)
-
-    0.5 단위 라인만 허용 (이진 결과 보장):
-      허용: ±0.5, ±1.0, ±1.5, ±2.0 ...
-      제외: 0.0 (Draw No Bet), ±0.25/±0.75 (쿼터핸디, 부분 환불 가능)
-
-    Returns:
-      (home_price, away_price, home_point, away_point)
-      조건 미충족 시 (None, None, None, None)
-    """
-    for market in pinnacle_data.get("markets", []):
-        if market.get("key") != "spreads":
-            continue
-
-        home_price = away_price = None
-        home_point = away_point = None
-
-        for outcome in market.get("outcomes", []):
-            name  = outcome.get("name", "")
-            price = outcome.get("price")
-            point = outcome.get("point")
-            if price is None or point is None:
-                continue
-            if name == home_team:
-                home_price = float(price)
-                home_point = float(point)
-            elif name == away_team:
-                away_price = float(price)
-                away_point = float(point)
-
-        if home_price is None or away_price is None:
-            return None, None, None, None
-
-        # 0.5 단위 라인 필터: point % 0.5 == 0 이고 0이 아닌 경우만
-        if home_point is not None and not _is_clean_handicap(home_point):
-            log.debug(
-                f"[odds_fetcher] 쿼터핸디 제외 ({home_point:+.2f}): "
-                f"{home_team} vs {away_team}"
-            )
-            return None, None, None, None
-
-        return home_price, away_price, home_point, away_point
-
-    return None, None, None, None
-
-
-def _is_clean_handicap(point: float) -> bool:
-    """0.5 단위 정수 핸디캡인지 확인 (이진 결과 보장).
-
-    허용: ±0.5, ±1.0, ±1.5, ±2.0 (abs % 0.5 == 0 이고 0이 아님)
-    제외: 0.0 (Draw No Bet), ±0.25, ±0.75, ±0.8, ±1.2 (쿼터핸디)
-    """
-    abs_point = abs(point)
-    if abs_point == 0.0:
-        return False
-    remainder = round(abs_point % 0.5, 6)
-    return remainder < 0.01

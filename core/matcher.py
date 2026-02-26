@@ -1,37 +1,30 @@
 """
-core/matcher.py - 경기 매핑 로직 (Odds API ↔ 폴리마켓)
+core/matcher.py - Gamma API 조회 + 경기 매핑 (Odds API ↔ 폴리마켓)
 
-문제:
-  Odds API:  "Los Angeles Lakers vs Boston Celtics"
-  폴리마켓:  "Will the Lakers beat the Celtics?"
+폴리마켓 NBA 마켓 형식:
+  "Heat vs. 76ers"     → YES = Heat(홈팀) 승, NO = 76ers(원정팀) 승
+  "Wizards vs. Hawks"  → YES = Wizards 승, NO = Hawks 승
 
-접근 방식:
-  1. team_mapping.json으로 팀 전체명 → 약칭 정규화
-  2. 폴리마켓 경기 제목에 양 팀 약칭이 모두 포함되는지 확인
-  3. 경기 시작 시간 ±3시간 이내인지 확인 (오매핑 방지)
-  4. 매핑 실패 시 해당 경기 스킵 (잘못된 베팅 방지)
+매핑 로직:
+  1. Gamma API tag_slug=nba 로 예정 경기 마켓 조회
+  2. "TeamA vs. TeamB" 형식 (순수 승/패 마켓만) 필터
+  3. team_mapping.json 으로 팀명 정규화 (예: "Miami Heat" → "Heat")
+  4. 팀명 + 경기 시간(±3h) 으로 매칭
 
-다종목 지원:
-  fetch_upcoming_poly_markets(session, sport_id) 로 종목별 태그 사용.
-  SPORTS_CONFIG[sport_id]["gamma_tag"] → Gamma API tag_slug 파라미터.
-
-폴리마켓 경기 조회:
-  Gamma API /events?tag_slug={gamma_tag}&active=true&closed=false
-  gameStartTime이 아직 시작 전인 마켓만 필터링
-
-반환:
-  MatchedGame 리스트 — Pinnacle 게임 + 폴리마켓 토큰 정보 매핑 완료
+매수 토큰 결정:
+  - 정배팀이 홈팀(YES측) → YES 토큰 매수
+  - 정배팀이 원정팀(NO측) → NO 토큰 매수
 """
 
 import json
 import logging
-import os
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 import aiohttp
 
-from config import GAMMA_BASE, TEAM_MAPPING_PATH, SPORTS_CONFIG
+from config import GAMMA_BASE, TEAM_MAPPING_PATH
 from core.odds_fetcher import PinnacleGame
 
 log = logging.getLogger(__name__)
@@ -40,239 +33,215 @@ log = logging.getLogger(__name__)
 # ── 데이터 구조 ─────────────────────────────────────────────
 
 @dataclass
-class PolymarketToken:
-    """폴리마켓 마켓의 단일 outcome 토큰."""
-    token_id: str    # CLOB token_id
-    outcome: str     # "Yes" | "No"
-
-
-@dataclass
 class PolymarketMarket:
-    """폴리마켓 단일 마켓 정보."""
-    condition_id: str
-    question: str           # 예: "Will the Lakers beat the Celtics?"
-    event_title: str        # 예: "Lakers vs Celtics"
-    game_start_time: datetime | None
-    tokens: list[PolymarketToken]   # [yes_token, no_token]
-    neg_risk: bool
-    tick_size: str
-
-    @property
-    def yes_token(self) -> PolymarketToken | None:
-        """Yes 토큰 반환."""
-        for t in self.tokens:
-            if t.outcome.lower() == "yes":
-                return t
-        return None
+    """폴리마켓 단일 NBA 승/패 마켓."""
+    condition_id:    str
+    question:        str       # 예: "Heat vs. 76ers"
+    game_start_time: datetime
+    home_short:      str       # 질문 앞팀 약칭 (예: "Heat")
+    away_short:      str       # 질문 뒷팀 약칭 (예: "76ers")
+    yes_token_id:    str       # YES = 홈팀(앞팀) 승리
+    no_token_id:     str       # NO  = 원정팀(뒷팀) 승리
 
 
 @dataclass
 class MatchedGame:
     """매핑 완료된 경기: Pinnacle 정보 + 폴리마켓 마켓."""
     pinnacle: PinnacleGame
-    poly_market: PolymarketMarket
+    poly:     PolymarketMarket
+
+    @property
+    def buy_yes(self) -> bool:
+        """정배팀이 홈팀(YES측)이면 True."""
+        return self.pinnacle.favorite_is_home
+
+    @property
+    def buy_token_id(self) -> str:
+        return self.poly.yes_token_id if self.buy_yes else self.poly.no_token_id
+
+    @property
+    def buy_token_label(self) -> str:
+        return "YES" if self.buy_yes else "NO"
 
     def __str__(self) -> str:
-        fav = self.pinnacle.favorite
-        fav_str = f"{fav.name} ({fav.odds:.2f})" if fav else "?"
         return (
             f"[MATCH] {self.pinnacle.home_team} vs {self.pinnacle.away_team}\n"
-            f"  폴리마켓: {self.poly_market.question}\n"
-            f"  정배: {fav_str}"
+            f"  폴리마켓: {self.poly.question}\n"
+            f"  정배: {self.pinnacle.favorite_team} "
+            f"({self.pinnacle.favorite_odds:.2f}배) | 매수: {self.buy_token_label}"
         )
 
 
 # ── 팀명 정규화 ─────────────────────────────────────────────
 
 def load_team_mapping() -> dict[str, str]:
-    """team_mapping.json 로드. 파일 없으면 빈 딕셔너리 반환."""
+    """team_mapping.json 로드. 없으면 빈 딕셔너리."""
     try:
         with open(TEAM_MAPPING_PATH, encoding="utf-8") as f:
             data = json.load(f)
-        # _comment 등 메타 키 제거
         return {k: v for k, v in data.items() if not k.startswith("_")}
     except FileNotFoundError:
-        log.warning(f"[matcher] {TEAM_MAPPING_PATH} 없음. 팀명 정규화 스킵.")
+        log.warning(f"[matcher] {TEAM_MAPPING_PATH} 없음 — 팀명 정규화 스킵")
         return {}
     except json.JSONDecodeError as e:
         log.error(f"[matcher] team_mapping.json 파싱 오류: {e}")
         return {}
 
 
-def normalize_team_name(full_name: str, mapping: dict[str, str]) -> str:
-    """전체 팀명 → 폴리마켓 약칭 정규화.
-
-    매핑에 없으면 전체 이름 그대로 반환.
-    예: "Los Angeles Lakers" → "Lakers"
-    """
+def normalize(full_name: str, mapping: dict[str, str]) -> str:
+    """Odds API 전체 팀명 → 폴리마켓 약칭. 매핑 없으면 원본 반환."""
     return mapping.get(full_name, full_name)
 
 
-# ── 폴리마켓 경기 조회 ──────────────────────────────────────
+# ── Gamma API 조회 ───────────────────────────────────────────
 
-async def fetch_upcoming_poly_markets(
+async def fetch_nba_poly_markets(
     session: aiohttp.ClientSession,
-    sport_id: str = "nba",
 ) -> list[PolymarketMarket]:
-    """Gamma API로 특정 종목의 예정 경기(시작 전) 마켓 목록 조회.
-
-    종목별 gamma_tag는 SPORTS_CONFIG에서 읽음.
-    주의: NHL/EPL의 실제 Gamma tag_slug는 폴리마켓 확인 후 보완 필요.
+    """Gamma API에서 NBA 예정 경기 승/패 마켓 조회.
 
     조건:
-      - tag_slug={gamma_tag}
-      - active=true, closed=false
-      - acceptingOrders=true (주문 수락 중)
-      - gameStartTime > now (아직 시작 안 한 경기)
-
-    Returns:
-        PolymarketMarket 리스트
+      - tag_slug=nba, active=true, closed=false
+      - acceptingOrders=true
+      - 순수 팀 vs 팀 마켓만 (_is_matchup 필터)
+      - game_start_time > now (아직 시작 전)
     """
-    cfg      = SPORTS_CONFIG.get(sport_id, {})
-    tag_slug = cfg.get("gamma_tag", sport_id)
-
     params = {
-        "tag_slug": tag_slug,
-        "active": "true",
-        "closed": "false",
-        "limit": 100,
+        "tag_slug": "nba",
+        "active":   "true",
+        "closed":   "false",
+        "limit":    200,
     }
 
     async with session.get(f"{GAMMA_BASE}/events", params=params) as resp:
         resp.raise_for_status()
         events: list[dict] = await resp.json()
 
-    label = cfg.get("label", sport_id)
-    now   = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc)
     markets: list[PolymarketMarket] = []
 
     for event in events:
-        event_title = event.get("title", "")
-        for raw_market in (event.get("markets") or []):
-            if not raw_market.get("acceptingOrders"):
+        for raw in (event.get("markets") or []):
+            if not raw.get("acceptingOrders"):
                 continue
-            gst = _parse_game_start_time(raw_market)
-            # 아직 시작 전인 경기만
+
+            question = raw.get("question", "").strip()
+            if not _is_matchup(question):
+                continue
+
+            gst = _parse_gst(raw)
             if gst is None or gst <= now:
                 continue
 
-            # 승/패 이진 마켓만 (Question이 "Will X beat Y?" 패턴)
-            question = raw_market.get("question", "")
-            if not _is_win_loss_market(question):
+            home_short, away_short = _split_teams(question)
+            if not home_short or not away_short:
                 continue
 
-            tokens = _extract_tokens(raw_market)
-            if not tokens:
+            yes_id, no_id = _extract_token_ids(raw)
+            if not yes_id or not no_id:
                 continue
 
-            market = PolymarketMarket(
-                condition_id=raw_market.get("conditionId", ""),
-                question=question,
-                event_title=event_title,
-                game_start_time=gst,
-                tokens=tokens,
-                neg_risk=bool(raw_market.get("negRisk", False)),
-                tick_size=str(raw_market.get("minTickSize") or "0.01"),
-            )
-            markets.append(market)
+            markets.append(PolymarketMarket(
+                condition_id    = raw.get("conditionId", ""),
+                question        = question,
+                game_start_time = gst,
+                home_short      = home_short,
+                away_short      = away_short,
+                yes_token_id    = yes_id,
+                no_token_id     = no_id,
+            ))
 
-    log.info(f"[matcher] 폴리마켓 {label} 예정 경기 마켓 {len(markets)}개 조회 완료")
+    log.info(f"[matcher] 폴리마켓 NBA 마켓 {len(markets)}개 조회")
     return markets
 
 
-def _parse_game_start_time(market: dict) -> datetime | None:
-    """gameStartTime 문자열 → UTC datetime. 없거나 파싱 실패 시 None."""
-    raw = market.get("gameStartTime")
-    if not raw:
+def _is_matchup(question: str) -> bool:
+    """순수 팀 대 팀 승/패 마켓인지 판별.
+
+    통과:  "Heat vs. 76ers"
+    제외:  "Will..." / "O/U" / "Spread" / 콜론 포함 세부 마켓
+           "X vs. Y: 1H Moneyline" 등 세부 마켓은 콜론(:)으로 식별
+    """
+    q = question.lower()
+    if q.startswith("will "):
+        return False
+    if any(kw in q for kw in ("o/u", "spread", "over", "under", "total", "points")):
+        return False
+    if " vs" not in q:
+        return False
+    # "X vs. Y: 세부정보" 형식 제외 (1H Moneyline, O/U 등)
+    # 순수 "X vs. Y" 는 콜론 없음
+    if ":" in question:
+        return False
+    return True
+
+
+def _split_teams(question: str) -> tuple[str, str]:
+    """'Heat vs. 76ers' → ('Heat', '76ers')"""
+    parts = re.split(r"\s+vs\.?\s+", question, flags=re.IGNORECASE)
+    if len(parts) == 2:
+        return parts[0].strip(), parts[1].strip()
+    return "", ""
+
+
+def _parse_gst(raw: dict) -> datetime | None:
+    """gameStartTime 문자열 → UTC datetime."""
+    s = raw.get("gameStartTime")
+    if not s:
         return None
     try:
-        raw = raw.replace(" ", "T")
-        if raw.endswith("+00"):
-            raw = raw[:-3] + "+00:00"
-        dt = datetime.fromisoformat(raw)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
+        s = s.replace(" ", "T")
+        if s.endswith("+00"):
+            s = s[:-3] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
     except ValueError:
         return None
 
 
-def _is_win_loss_market(question: str) -> bool:
-    """승/패 이진 마켓인지 판별.
-
-    폴리마켓 NBA 승/패 마켓은 "Will X beat Y?" 또는 "Will the X win?" 패턴.
-    토탈 포인트, 핸디캡 등 다른 마켓 제외.
-    """
-    q_lower = question.lower()
-    # 포인트 토탈, 핸디캡, 시즌 전체 마켓 제외 키워드
-    # "finals/playoffs/champion/cup/qualify" 추가: 챔피언십·플레이오프 시즌 마켓 제외
-    exclude_keywords = [
-        "total", "points", "over", "under", "score", "spread",
-        "finals", "playoffs", "champion", "cup", "qualify",
-    ]
-    for kw in exclude_keywords:
-        if kw in q_lower:
-            return False
-    # 승/패 판별 키워드
-    win_keywords = ["beat", "win", "defeat"]
-    for kw in win_keywords:
-        if kw in q_lower:
-            return True
-    return False
-
-
-def _extract_tokens(market: dict) -> list[PolymarketToken]:
-    """마켓에서 (token_id, outcome) 쌍 추출."""
-    import json as _json
-    raw_ids = market.get("clobTokenIds")
-    raw_outcomes = market.get("outcomes")
+def _extract_token_ids(raw: dict) -> tuple[str, str]:
+    """clobTokenIds에서 YES(index 0) / NO(index 1) token_id 추출."""
+    raw_ids      = raw.get("clobTokenIds")
+    raw_outcomes = raw.get("outcomes")
     if not raw_ids or not raw_outcomes:
-        return []
-    ids = _json.loads(raw_ids) if isinstance(raw_ids, str) else raw_ids
-    outcomes = _json.loads(raw_outcomes) if isinstance(raw_outcomes, str) else raw_outcomes
-    return [
-        PolymarketToken(token_id=tid, outcome=out)
-        for tid, out in zip(ids, outcomes)
-        if isinstance(tid, str) and tid
-    ]
+        return "", ""
+
+    ids = json.loads(raw_ids) if isinstance(raw_ids, str) else raw_ids
+    if len(ids) < 2:
+        return "", ""
+
+    return str(ids[0]), str(ids[1])
 
 
-# ── 핵심 매핑 함수 ──────────────────────────────────────────
+# ── 핵심 매핑 함수 ───────────────────────────────────────────
 
 def match_games(
     pinnacle_games: list[PinnacleGame],
-    poly_markets: list[PolymarketMarket],
-    team_mapping: dict[str, str],
+    poly_markets:   list[PolymarketMarket],
+    team_mapping:   dict[str, str],
 ) -> list[MatchedGame]:
-    """Pinnacle 경기 목록과 폴리마켓 마켓 목록을 매핑.
+    """Pinnacle 경기 목록 ↔ 폴리마켓 마켓 목록 매핑.
 
     매핑 조건:
-      1. 양 팀 약칭이 폴리마켓 질문 또는 event_title에 모두 포함
-      2. 경기 시작 시간 ±3시간 이내 (오매핑 방지)
-
-    매핑 실패 시 해당 경기 스킵 (오매핑으로 인한 잘못된 베팅 방지).
+      1. 홈/원정 팀 약칭이 폴리마켓 마켓 팀명에 모두 포함
+      2. 경기 시작 시간 ±3시간 이내
+    매핑 실패 시 스킵 (오매핑으로 인한 잘못된 베팅 방지).
     """
     results: list[MatchedGame] = []
 
     for game in pinnacle_games:
-        home_short = normalize_team_name(game.home_team, team_mapping)
-        away_short = normalize_team_name(game.away_team, team_mapping)
+        home_s = normalize(game.home_team, team_mapping)
+        away_s = normalize(game.away_team, team_mapping)
 
-        matched_market = _find_matching_market(
-            poly_markets,
-            home_short,
-            away_short,
-            game.commence_time,
-        )
-
-        if matched_market is None:
+        market = _find_market(poly_markets, home_s, away_s, game.commence_time)
+        if market is None:
             log.debug(
-                f"[matcher] 매핑 실패 스킵: {game.home_team} vs {game.away_team} "
-                f"(home_short={home_short}, away_short={away_short})"
+                f"[matcher] 매핑 실패: {game.home_team} vs {game.away_team} "
+                f"(home_s={home_s}, away_s={away_s})"
             )
             continue
 
-        matched = MatchedGame(pinnacle=game, poly_market=matched_market)
+        matched = MatchedGame(pinnacle=game, poly=market)
         results.append(matched)
         log.info(str(matched))
 
@@ -280,53 +249,34 @@ def match_games(
     return results
 
 
-def _find_matching_market(
-    poly_markets: list[PolymarketMarket],
-    home_short: str,
-    away_short: str,
+def _find_market(
+    markets:       list[PolymarketMarket],
+    home_s:        str,
+    away_s:        str,
     commence_time: datetime,
-    time_tolerance_hrs: float = 3.0,
+    tol_hrs:       float = 3.0,
 ) -> PolymarketMarket | None:
-    """단일 Pinnacle 경기에 매칭되는 폴리마켓 마켓 반환.
+    """단일 Pinnacle 경기에 매칭되는 폴리마켓 마켓 반환."""
+    tol  = timedelta(hours=tol_hrs)
+    hits = []
 
-    Args:
-        poly_markets: 전체 폴리마켓 마켓 목록
-        home_short: 홈 팀 약칭
-        away_short: 원정 팀 약칭
-        commence_time: Odds API 경기 시작 시간 (UTC)
-        time_tolerance_hrs: 경기 시간 허용 오차 (시간)
-
-    Returns:
-        매칭 마켓. 없거나 복수 매칭 시 None.
-    """
-    tolerance = timedelta(hours=time_tolerance_hrs)
-    candidates: list[PolymarketMarket] = []
-
-    for market in poly_markets:
-        # 팀명 매칭: question 또는 event_title에 양 팀 약칭 포함 여부
-        search_text = f"{market.question} {market.event_title}".lower()
-        if home_short.lower() not in search_text:
-            continue
-        if away_short.lower() not in search_text:
+    for m in markets:
+        # 팀명 매칭: 홈/원정 약칭이 폴리마켓 마켓의 home_short/away_short에 포함
+        market_text = f"{m.home_short} {m.away_short}".lower()
+        if home_s.lower() not in market_text or away_s.lower() not in market_text:
             continue
 
-        # 시간 매칭
-        if market.game_start_time is None:
-            continue
-        time_diff = abs(market.game_start_time - commence_time)
-        if time_diff > tolerance:
+        # 시간 매칭: ±3시간
+        if abs(m.game_start_time - commence_time) > tol:
             continue
 
-        candidates.append(market)
+        hits.append(m)
 
-    if len(candidates) == 1:
-        return candidates[0]
+    if len(hits) == 1:
+        return hits[0]
 
-    if len(candidates) > 1:
+    if len(hits) > 1:
         log.warning(
-            f"[matcher] 복수 매칭 ({len(candidates)}개) — 스킵: "
-            f"{home_short} vs {away_short}"
+            f"[matcher] 복수 매칭 ({len(hits)}개) — 스킵: {home_s} vs {away_s}"
         )
-        return None
-
     return None
