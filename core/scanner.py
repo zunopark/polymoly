@@ -173,16 +173,21 @@ async def _fetch_orderbook(
 
 
 def _best_ask_and_shares(book: dict) -> tuple[float | None, float]:
-    """오더북에서 최저 ask 가격과 수량 추출."""
+    """오더북에서 최저 ask 가격과 근방 유동성 추출.
+
+    CLOB 오더북은 asks가 내림차순(비쌈→쌈) 정렬.
+    asks[-1]이 최저 ask(매수자에게 유리한 가격).
+    유동성은 최저 ask 근방 3개 호가 합산.
+    """
     asks = book.get("asks", [])
     if not asks:
         return None, 0.0
-    best  = asks[0]
+    best  = asks[-1]
     price = best.get("price")
-    size  = best.get("size", 0)
     if price is None:
         return None, 0.0
-    return float(price), float(size)
+    shares = sum(float(a.get("size", 0)) for a in asks[-3:])
+    return float(price), shares
 
 
 def _calc_bet(gap: float) -> float:

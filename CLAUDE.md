@@ -164,11 +164,14 @@ TELEGRAM_CHAT_ID=
   - [x] 폴링 시작, 정배 없음, 마켓 없음, 매핑 실패, 기회 없음
   - [x] 크레딧 경고, 네트워크/예상치 못한 오류
   - [x] 포지션 정산 알림 (monitor.py notify_settled 연결 — 미호출 버그 수정)
-- [ ] 폴리마켓 매수 실행 검증 (core/executor.py)
+- [x] 폴리마켓 매수 실행 검증 (core/executor.py)
   - [x] executor.py 버그 수정 완료 (아래 참고)
   - [x] test_executor.py 작성 완료 (dry-run / --confirm 모드)
-  - [ ] **SSL 문제로 테스트 중단** — py-clob-client L2 인증 호출 시 "Request exception!" 발생
-  - [ ] SSL 해결 후: `python test_executor.py --confirm --amount 5` 로 실제 매수 테스트
+  - [x] test_executor.py dry-run 정상 동작 확인 (L2 인증, 잔고, 마켓 조회, 오더북, 후보 선정)
+  - [x] allowance 파싱 버그 수정 (`"allowance"` 단수 → `"allowances"` 복수 딕셔너리)
+  - [x] CLOB 오더북 정렬 버그 수정 (`asks[0]` 최고가 → `asks[-1]` 최저가) — test_executor.py + scanner.py
+  - [x] 유동성 집계 버그 수정 (단일 호가 size → asks[-3:] 합산) — test_executor.py + scanner.py
+  - [ ] `python test_executor.py --confirm --amount 5` 로 실제 매수 테스트
 - [ ] 소액으로 먼저 실전 운영 시작 (최대 배팅 금액 $10~30)
 - [ ] db.py 배팅 기록 확인 기능 추가
 - [ ] NHL 추가 (NBA 안정화 후)
@@ -176,36 +179,6 @@ TELEGRAM_CHAT_ID=
 
 ---
 
-## 현재 블로커: SSL / 네트워크 이슈
-
-### 증상
-`py-clob-client` 의 L2 인증 API 호출 (`get_api_keys`, `get_balance_allowance` 등)에서
-`PolyApiException[status_code=None, error_message=Request exception!]` 발생.
-
-### 원인 추정
-- py-clob-client 내부는 `requests` 라이브러리 사용 (aiohttp 아님)
-- test_integration.py 의 SSL 우회 (`ctx.check_hostname=False`) 가 적용되지 않음
-- macOS VPN / 방화벽 / 지역 차단(Geoblock) 가능성
-
-### 해결 방법 후보
-1. **VPN 끄거나 켜기** — 지역 차단 여부 확인 (미국 IP 필요할 수 있음)
-2. **requests SSL 우회 패치** — py-clob-client 내부 session에 `verify=False` 적용
-   ```python
-   import requests, urllib3
-   urllib3.disable_warnings()
-   requests.packages.urllib3.disable_warnings()
-   # ClobClient 초기화 후:
-   client._session.verify = False  # 내부 session 접근 가능 시
-   ```
-3. **환경 변수로 SSL 우회**
-   ```bash
-   PYTHONHTTPSVERIFY=0 python test_executor.py
-   ```
-4. **py-clob-client 소스 직접 확인** — session 생성 방식 파악 후 패치
-
 ### 다음 재개 시 순서
-1. SSL 문제 해결
-2. `python test_executor.py` (dry-run) → L2 인증 + 잔고 확인
-3. `python test_executor.py --confirm --amount 5` → 실제 $5 FOK 매수
-4. DB 기록 확인 (`data/positions.db`)
-5. CLAUDE.md 체크박스 업데이트
+1. `python test_executor.py --confirm --amount 5` → 실제 $5 FOK 매수
+2. DB 기록 확인 (`data/positions.db`)

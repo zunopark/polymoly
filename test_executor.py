@@ -107,14 +107,16 @@ async def test_credentials(client) -> dict | None:
             client.get_balance_allowance,
             BalanceAllowanceParams(asset_type=AssetType.COLLATERAL),
         )
-        balance    = float(balance_resp.get("balance", 0)) / 1e6       # USDC.e는 6 decimals
-        allowance  = float(balance_resp.get("allowance", 0)) / 1e6
-        ok(f"USDC 잔고: ${balance:.2f}  |  허용 한도: ${allowance:.2f}")
+        balance = float(balance_resp.get("balance", 0)) / 1e6   # USDC.e는 6 decimals
+        # 응답 구조: {"allowances": {"0x교환소주소": "금액", ...}}
+        allowances_dict = balance_resp.get("allowances", {})
+        total_allowance = sum(int(v) for v in allowances_dict.values()) / 1e6 if allowances_dict else 0
+        ok(f"USDC 잔고: ${balance:.2f}  |  허용 한도: {'무제한' if total_allowance > 1e20 else f'${total_allowance:.2f}'} ({len(allowances_dict)}개 거래소)")
 
         if balance < 5:
             warn(f"USDC 잔고 ${balance:.2f} — $5 미만이라 실제 매수 불가")
 
-        return {"balance": balance, "allowance": allowance}
+        return {"balance": balance, "allowances": allowances_dict}
 
     except Exception as e:
         warn(f"잔고 조회 실패 (주문은 가능할 수 있음): {e}")
@@ -186,8 +188,9 @@ async def select_target(
             if not asks:
                 continue
 
-            best_ask = float(asks[0]["price"])
-            shares   = sum(float(a["size"]) for a in asks[:3])
+            # CLOB 오더북: asks는 내림차순(비쌈→쌈) → asks[-1]이 최저 ask(매수 최적가)
+            best_ask = float(asks[-1]["price"])
+            shares   = sum(float(a["size"]) for a in asks[-3:])
 
             # tick_size, neg_risk 조회
             try:
@@ -349,6 +352,8 @@ async def main(confirm: bool, amount: float) -> None:
             if cred_info["balance"] < amount:
                 fail(f"USDC 잔고 ${cred_info['balance']:.2f} < ${amount:.0f} — 매수 불가")
                 return
+            if not cred_info.get("allowances"):
+                warn("allowance 미설정 — 주문이 거부될 수 있음")
 
         # [2] 마켓 조회
         markets = await test_markets(session)
